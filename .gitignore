@@ -1,0 +1,10 @@
+# Model weights (16GB+, stored locally not in git)
+models/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# Logs
+*.log
