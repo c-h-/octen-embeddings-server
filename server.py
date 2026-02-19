@@ -30,6 +30,11 @@ from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 import uvicorn
+from prometheus_client import (
+    Counter, Histogram, Gauge,
+    generate_latest, CONTENT_TYPE_LATEST,
+)
+from starlette.responses import Response
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -61,6 +66,35 @@ logger = setup_logging()
 
 
 # ---------------------------------------------------------------------------
+# Prometheus metrics
+# ---------------------------------------------------------------------------
+
+REQUESTS_TOTAL = Counter(
+    "embeddings_requests_total",
+    "Total embedding requests",
+    ["endpoint"],
+)
+DURATION_SECONDS = Histogram(
+    "embeddings_duration_seconds",
+    "Embedding request duration in seconds",
+    ["endpoint"],
+)
+BATCH_SIZE = Histogram(
+    "embeddings_batch_size",
+    "Number of texts per embedding request",
+    buckets=[1, 2, 4, 8, 16, 32, 64, 128, 256],
+)
+TOKENS_TOTAL = Counter(
+    "embeddings_tokens_total",
+    "Total tokens processed (estimated)",
+)
+MODEL_LOADED = Gauge(
+    "embeddings_model_loaded",
+    "Whether the embedding model is loaded (1) or not (0)",
+)
+
+
+# ---------------------------------------------------------------------------
 # Model manager
 # ---------------------------------------------------------------------------
 
@@ -87,6 +121,7 @@ class ModelManager:
             logger.info("Model loaded in %.2fs. Warming up...", self.load_time)
             self._warmup()
             self.ready = True
+            MODEL_LOADED.set(1)
             logger.info("Model ready.")
 
     def _warmup(self) -> None:
@@ -238,12 +273,19 @@ async def openai_embeddings(request: EmbeddingRequest):
     if not texts:
         raise HTTPException(400, "Input must not be empty")
 
+    REQUESTS_TOTAL.labels(endpoint="/v1/embeddings").inc()
+    BATCH_SIZE.observe(len(texts))
+
     t0 = time.time()
     embeddings = manager.embed(texts)
-    elapsed_ms = (time.time() - t0) * 1000
+    elapsed = time.time() - t0
+    elapsed_ms = elapsed * 1000
+
+    DURATION_SECONDS.labels(endpoint="/v1/embeddings").observe(elapsed)
 
     # Estimate token count (rough: chars / 4)
     total_tokens = sum(len(t) for t in texts) // 4 or 1
+    TOKENS_TOTAL.inc(total_tokens)
 
     data = [
         EmbeddingObject(embedding=emb.tolist(), index=i)
@@ -270,9 +312,13 @@ async def openai_embeddings(request: EmbeddingRequest):
 async def embed_single(request: LegacyEmbedRequest):
     if not manager.ready:
         raise HTTPException(503, "Model not loaded yet")
+    REQUESTS_TOTAL.labels(endpoint="/embed").inc()
+    BATCH_SIZE.observe(1)
     t0 = time.time()
     embeddings = manager.embed([request.text])
     elapsed = (time.time() - t0) * 1000
+    DURATION_SECONDS.labels(endpoint="/embed").observe(elapsed / 1000)
+    TOKENS_TOTAL.inc(len(request.text) // 4 or 1)
     return LegacyEmbedResponse(
         embedding=embeddings[0].tolist(),
         model=MODEL_ID,
@@ -287,9 +333,13 @@ async def embed_batch(request: LegacyBatchRequest):
         raise HTTPException(503, "Model not loaded yet")
     if len(request.texts) > MAX_BATCH_SIZE:
         raise HTTPException(400, f"Batch too large: {len(request.texts)} > {MAX_BATCH_SIZE}")
+    REQUESTS_TOTAL.labels(endpoint="/embed_batch").inc()
+    BATCH_SIZE.observe(len(request.texts))
     t0 = time.time()
     embeddings = manager.embed(request.texts)
     elapsed = (time.time() - t0) * 1000
+    DURATION_SECONDS.labels(endpoint="/embed_batch").observe(elapsed / 1000)
+    TOKENS_TOTAL.inc(sum(len(t) for t in request.texts) // 4 or 1)
     return LegacyBatchResponse(
         embeddings=embeddings.tolist(),
         model=MODEL_ID,
@@ -303,6 +353,11 @@ async def embed_batch(request: LegacyBatchRequest):
 # ---------------------------------------------------------------------------
 # Monitoring
 # ---------------------------------------------------------------------------
+
+@app.get("/metrics")
+async def metrics():
+    """Prometheus metrics endpoint."""
+    return Response(content=generate_latest(), media_type=CONTENT_TYPE_LATEST)
 
 @app.get("/health")
 async def health():
