@@ -23,8 +23,6 @@ classifiers = [
 ]
 
 dependencies = [
-    "mlx>=0.30.0",
-    "mlx-lm>=0.26.3",
     "fastapi>=0.116.0",
     "uvicorn[standard]>=0.35.0",
     "pydantic>=2.10.0",
@@ -34,6 +32,10 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+mlx = [
+    "mlx>=0.30.0",
+    "mlx-lm>=0.26.3",
+]
 dev = [
     "ruff>=0.9.0",
     "pytest>=8.0.0",
@@ -50,7 +52,7 @@ octen-embeddings = "server:main"
 Repository = "https://github.com/c-h-/octen-embeddings-server"
 
 [tool.setuptools]
-py-modules = ["server", "convert_model", "validate"]
+py-modules = ["server", "convert_model", "validate", "benchmark"]
 
 [tool.ruff]
 target-version = "py311"

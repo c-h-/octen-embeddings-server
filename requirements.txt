@@ -1,8 +1,11 @@
-mlx>=0.30.0
-mlx-lm>=0.26.3
+# Core dependencies
 fastapi>=0.116.0
 uvicorn[standard]>=0.35.0
 pydantic>=2.10.0
 numpy>=2.0.0
 psutil>=7.0.0
 prometheus-client>=0.21.0
+
+# Apple Silicon only (install via: pip install -e ".[mlx]")
+mlx>=0.30.0
+mlx-lm>=0.26.3

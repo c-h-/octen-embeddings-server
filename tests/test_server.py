@@ -126,3 +126,76 @@ class TestModelNotReady:
         with patch.object(server.manager, "ready", False):
             resp = client.post("/v1/embeddings", json={"input": "test"})
             assert resp.status_code == 503
+
+
+class TestAuthentication:
+    """Test optional API key authentication."""
+
+    def test_no_auth_required_by_default(self, client):
+        resp = client.post("/v1/embeddings", json={"input": "test"})
+        assert resp.status_code == 200
+
+    def test_auth_required_when_api_key_set(self, client):
+        with patch.object(server, "API_KEY", "test-key"):
+            resp = client.post("/v1/embeddings", json={"input": "test"})
+            assert resp.status_code == 401
+
+    def test_auth_accepted_with_valid_key(self, client):
+        with patch.object(server, "API_KEY", "test-key"):
+            resp = client.post(
+                "/v1/embeddings",
+                json={"input": "test"},
+                headers={"Authorization": "Bearer test-key"},
+            )
+            assert resp.status_code == 200
+
+    def test_auth_rejected_with_wrong_key(self, client):
+        with patch.object(server, "API_KEY", "test-key"):
+            resp = client.post(
+                "/v1/embeddings",
+                json={"input": "test"},
+                headers={"Authorization": "Bearer wrong-key"},
+            )
+            assert resp.status_code == 401
+
+    def test_health_no_auth_required(self, client):
+        with patch.object(server, "API_KEY", "test-key"):
+            resp = client.get("/health")
+            assert resp.status_code == 200
+
+    def test_metrics_no_auth_required(self, client):
+        with patch.object(server, "API_KEY", "test-key"):
+            resp = client.get("/metrics")
+            assert resp.status_code == 200
+
+    def test_legacy_embed_requires_auth(self, client):
+        with patch.object(server, "API_KEY", "test-key"):
+            resp = client.post("/embed", json={"text": "hello"})
+            assert resp.status_code == 401
+
+    def test_legacy_embed_batch_requires_auth(self, client):
+        with patch.object(server, "API_KEY", "test-key"):
+            resp = client.post("/embed_batch", json={"texts": ["hello"]})
+            assert resp.status_code == 401
+
+
+class TestGracefulShutdown:
+    """Test shutdown middleware behavior."""
+
+    def test_503_during_shutdown(self, client):
+        client.app.state.shutting_down = True
+        resp = client.post("/v1/embeddings", json={"input": "test"})
+        assert resp.status_code == 503
+        client.app.state.shutting_down = False
+
+    def test_health_available_during_shutdown(self, client):
+        client.app.state.shutting_down = True
+        resp = client.get("/health")
+        assert resp.status_code == 200
+        client.app.state.shutting_down = False
+
+    def test_metrics_available_during_shutdown(self, client):
+        client.app.state.shutting_down = True
+        resp = client.get("/metrics")
+        assert resp.status_code == 200
+        client.app.state.shutting_down = False

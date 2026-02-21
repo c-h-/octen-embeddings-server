@@ -6,7 +6,7 @@ Developer reference for AI coding agents and contributors.
 
 ```bash
 python3 -m venv .venv && source .venv/bin/activate
-pip install -e ".[dev]"
+pip install -e ".[dev,mlx]"    # mlx extra requires Apple Silicon
 python3 server.py              # start server (needs model weights)
 python3 validate.py            # integration tests against running server
 ```
@@ -91,7 +91,7 @@ GitHub Actions runs on push and PR to `main`:
 2. Format check (`ruff format --check`)
 3. Unit tests (`pytest`)
 
-Integration tests and type checking are not in CI because they require the MLX model (Apple Silicon + 16 GB model weights).
+MLX dependencies are in an optional `[mlx]` extra so that lint and unit tests can run on Linux CI. Integration tests and type checking are not in CI because they require the MLX model (Apple Silicon + 16 GB model weights).
 
 ## Git
 

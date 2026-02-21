@@ -16,6 +16,7 @@ Key differences from base Qwen3:
 import asyncio
 import logging
 import os
+import signal
 import sys
 import time
 from contextlib import asynccontextmanager
@@ -23,7 +24,7 @@ from contextlib import asynccontextmanager
 import mlx.core as mx
 import numpy as np
 import uvicorn
-from fastapi import FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from mlx_lm import load
 from prometheus_client import (
@@ -50,6 +51,7 @@ MAX_TEXT_LENGTH = int(os.getenv("MAX_TEXT_LENGTH", "8192"))
 MAX_BATCH_SIZE = int(os.getenv("MAX_BATCH_SIZE", "256"))
 PORT = int(os.getenv("PORT", "8100"))
 HOST = os.getenv("HOST", "127.0.0.1")
+API_KEY = os.getenv("API_KEY", "")  # empty = no auth required
 
 
 def setup_logging() -> logging.Logger:
@@ -63,6 +65,21 @@ def setup_logging() -> logging.Logger:
 
 
 logger = setup_logging()
+
+
+# ---------------------------------------------------------------------------
+# Authentication (optional — set API_KEY env var to enable)
+# ---------------------------------------------------------------------------
+
+
+async def verify_api_key(request: Request):
+    """Require a valid Bearer token when API_KEY is configured."""
+    if not API_KEY:
+        return
+    auth = request.headers.get("Authorization", "")
+    if auth == f"Bearer {API_KEY}":
+        return
+    raise HTTPException(status_code=401, detail="Invalid or missing API key")
 
 
 # ---------------------------------------------------------------------------
@@ -151,18 +168,29 @@ class ModelManager:
         return last
 
     def embed(self, texts: list[str]) -> np.ndarray:
-        """Embed a list of texts. Returns (N, 4096) float32 numpy array."""
-        results = []
+        """Embed a list of texts. Returns (N, 4096) float32 numpy array.
+
+        Texts are tokenized, padded to equal length, and processed as a
+        single batched forward pass for significantly higher throughput on
+        Apple Silicon compared to sequential processing.
+        """
+        # Tokenize all texts and truncate to MAX_TEXT_LENGTH
+        all_tokens = []
         for text in texts:
             tokens = self.tokenizer.encode(text)
             if len(tokens) > MAX_TEXT_LENGTH:
                 tokens = tokens[:MAX_TEXT_LENGTH]
-            input_ids = mx.array([tokens])
-            pooled = self._forward(input_ids)
-            mx.eval(pooled)
-            vec = np.array(pooled.tolist()[0], dtype=np.float32)
-            results.append(vec)
-        return np.array(results, dtype=np.float32)
+            all_tokens.append(tokens)
+
+        # Pad to the longest sequence in this batch
+        max_len = max(len(t) for t in all_tokens)
+        pad_id = self.tokenizer.pad_token_id if self.tokenizer.pad_token_id is not None else 0
+        padded = [t + [pad_id] * (max_len - len(t)) for t in all_tokens]
+
+        input_ids = mx.array(padded)  # [batch, max_len]
+        pooled = self._forward(input_ids)
+        mx.eval(pooled)
+        return np.array(pooled.tolist(), dtype=np.float32)
 
 
 manager = ModelManager()
@@ -246,7 +274,22 @@ async def lifespan(app: FastAPI):
     except Exception:
         logger.exception("Failed to load model at startup")
     app.state.start_time = time.time()
+    app.state.shutting_down = False
+
+    shutdown_event = asyncio.Event()
+
+    def _signal_handler(sig, _frame):
+        name = signal.Signals(sig).name
+        logger.info("Received %s — draining requests and shutting down", name)
+        app.state.shutting_down = True
+        shutdown_event.set()
+
+    loop = asyncio.get_running_loop()
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        loop.add_signal_handler(sig, _signal_handler, sig, None)
+
     yield
+
     logger.info("Shutting down.")
 
 
@@ -265,12 +308,20 @@ app.add_middleware(
 )
 
 
+@app.middleware("http")
+async def shutdown_middleware(request: Request, call_next):
+    """Reject new embedding requests while the server is draining."""
+    if getattr(request.app.state, "shutting_down", False) and request.url.path not in ("/health", "/metrics"):
+        return Response(content='{"detail":"Server is shutting down"}', status_code=503, media_type="application/json")
+    return await call_next(request)
+
+
 # ---------------------------------------------------------------------------
 # OpenAI-compatible endpoint
 # ---------------------------------------------------------------------------
 
 
-@app.post("/v1/embeddings", response_model=EmbeddingResponse)
+@app.post("/v1/embeddings", response_model=EmbeddingResponse, dependencies=[Depends(verify_api_key)])
 async def openai_embeddings(request: EmbeddingRequest):
     """OpenAI-compatible embeddings endpoint."""
     if not manager.ready:
@@ -319,7 +370,7 @@ async def openai_embeddings(request: EmbeddingRequest):
 # ---------------------------------------------------------------------------
 
 
-@app.post("/embed", response_model=LegacyEmbedResponse)
+@app.post("/embed", response_model=LegacyEmbedResponse, dependencies=[Depends(verify_api_key)])
 async def embed_single(request: LegacyEmbedRequest):
     if not manager.ready:
         raise HTTPException(503, "Model not loaded yet")
@@ -339,7 +390,7 @@ async def embed_single(request: LegacyEmbedRequest):
     )
 
 
-@app.post("/embed_batch", response_model=LegacyBatchResponse)
+@app.post("/embed_batch", response_model=LegacyBatchResponse, dependencies=[Depends(verify_api_key)])
 async def embed_batch(request: LegacyBatchRequest):
     if not manager.ready:
         raise HTTPException(503, "Model not loaded yet")

@@ -176,7 +176,27 @@ All configuration is via environment variables:
 | `MAX_TEXT_LENGTH` | `8192` | Maximum tokens per text (truncated if exceeded) |
 | `MAX_BATCH_SIZE` | `256` | Maximum texts per batch request |
 | `LOG_LEVEL` | `INFO` | Logging level (DEBUG, INFO, WARNING, ERROR) |
+| `API_KEY` | *(empty)* | API key for Bearer auth; leave empty to disable |
 | `DEV_MODE` | `false` | Enable uvicorn auto-reload for development |
+
+### Authentication
+
+By default, no authentication is required (suitable for localhost). For non-localhost deployments, set the `API_KEY` environment variable:
+
+```bash
+API_KEY=sk-my-secret-key python3 server.py
+```
+
+Clients must then include a Bearer token:
+
+```bash
+curl http://host:8100/v1/embeddings \
+  -H "Authorization: Bearer sk-my-secret-key" \
+  -H "Content-Type: application/json" \
+  -d '{"input": "Hello world"}'
+```
+
+Health and metrics endpoints (`/health`, `/metrics`) do not require authentication.
 
 ## Performance
 
@@ -191,6 +211,19 @@ First request after startup includes a warmup phase (~2-5s) for Metal kernel com
 
 Memory: the model loads ~16 GB into unified memory. The server process uses ~17 GB total at steady state.
 
+## Benchmarking
+
+A throughput benchmark script is included:
+
+```bash
+python3 benchmark.py                           # default (5 rounds)
+python3 benchmark.py --rounds 10               # more rounds for accuracy
+python3 benchmark.py --url http://host:8100    # custom server URL
+python3 benchmark.py --api-key sk-xxx          # if auth is enabled
+```
+
+This measures latency and texts/sec across various text lengths and batch sizes.
+
 ## Development
 
 ```bash
@@ -201,6 +234,16 @@ pytest                        # unit tests
 python3 validate.py           # integration tests (requires running server)
 ```
 
+## Model Licensing
+
+This server is MIT-licensed. However, the **Octen-Embedding-8B model weights** have their own license terms:
+
+- **Octen-Embedding-8B** is published by [Octen AI](https://huggingface.co/Octen) on HuggingFace. Check the [model card](https://huggingface.co/Octen/Octen-Embedding-8B) for current license terms before use in production.
+- The model is a fine-tune of **Qwen3**, which is released under the [Apache 2.0 license](https://huggingface.co/Qwen). Qwen3's license permits commercial use but requires attribution.
+- The `convert_model.py` script downloads weights from HuggingFace; you are responsible for complying with the model's license when downloading and deploying.
+
+**Summary**: This server code (MIT) and the model weights (separate license) have independent terms. Always verify the upstream model license for your use case.
+
 ## License
 
-MIT
+MIT — see [LICENSE](LICENSE).
