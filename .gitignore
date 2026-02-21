@@ -4,7 +4,15 @@ models/
 # Python
 __pycache__/
 *.pyc
+*.pyo
 .venv/
+*.egg-info/
+dist/
+build/
 
 # Logs
 *.log
+
+# IDE
+.vscode/
+.idea/

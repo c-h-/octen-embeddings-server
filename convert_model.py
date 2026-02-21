@@ -99,7 +99,7 @@ def main():
         (OUTPUT_DIR / old_name).rename(OUTPUT_DIR / new_name)
         # Build weight map
         shard_weights = mx.load(str(OUTPUT_DIR / new_name))
-        for key in shard_weights.keys():
+        for key in shard_weights:
             weight_map[key] = new_name
 
     # Write weight map index
@@ -127,8 +127,9 @@ def main():
     # Verify we can load it
     print("\nStep 7: Verifying model loads...")
     from mlx_lm import load
+
     model, tokenizer = load(str(OUTPUT_DIR))
-    print(f"  Model loaded successfully!")
+    print("  Model loaded successfully!")
     print(f"  Model type: {type(model).__name__}")
     print(f"  Layers: {len(model.model.layers)}")
 
