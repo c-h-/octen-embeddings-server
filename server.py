@@ -476,11 +476,10 @@ async def list_models_legacy():
 
 def main():
     uvicorn.run(
-        "server:app",
+        app,
         host=HOST,
         port=PORT,
         log_level=os.getenv("LOG_LEVEL", "info").lower(),
-        reload=os.getenv("DEV_MODE", "false").lower() == "true",
     )
 
 
