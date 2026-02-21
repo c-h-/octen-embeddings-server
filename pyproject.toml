@@ -1,0 +1,63 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "octen-embeddings-server"
+version = "1.0.0"
+description = "Local MLX embeddings server with OpenAI-compatible API for Apple Silicon"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.11"
+authors = [{ name = "Charlie Hulcher" }]
+keywords = ["embeddings", "mlx", "apple-silicon", "openai", "llm"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Operating System :: MacOS",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+dependencies = [
+    "mlx>=0.30.0",
+    "mlx-lm>=0.26.3",
+    "fastapi>=0.116.0",
+    "uvicorn[standard]>=0.35.0",
+    "pydantic>=2.10.0",
+    "numpy>=2.0.0",
+    "psutil>=7.0.0",
+    "prometheus-client>=0.21.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "ruff>=0.9.0",
+    "pytest>=8.0.0",
+    "httpx>=0.28.0",
+]
+convert = [
+    "huggingface-hub>=0.27.0",
+]
+
+[project.scripts]
+octen-embeddings = "server:main"
+
+[project.urls]
+Repository = "https://github.com/c-h-/octen-embeddings-server"
+
+[tool.setuptools]
+py-modules = ["server", "convert_model", "validate"]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 120
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "SIM"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

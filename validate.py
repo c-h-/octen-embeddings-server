@@ -14,10 +14,11 @@ Usage:
   python3 validate.py [--url http://localhost:8100]
 """
 
-import sys
-import json
 import argparse
+import json
+import sys
 import urllib.request
+
 
 def fetch(url, data=None):
     """Simple HTTP request helper."""
@@ -33,7 +34,7 @@ def fetch(url, data=None):
 
 def cosine_sim(a, b):
     """Cosine similarity between two vectors."""
-    dot = sum(x * y for x, y in zip(a, b))
+    dot = sum(x * y for x, y in zip(a, b, strict=False))
     norm_a = sum(x * x for x in a) ** 0.5
     norm_b = sum(x * x for x in b) ** 0.5
     return dot / (norm_a * norm_b) if norm_a and norm_b else 0.0
@@ -96,9 +97,9 @@ def main():
     print("\n--- Cosine Similarity Sanity ---")
     try:
         all_texts = [
-            "The weather is sunny today",        # 0
-            "It's a beautiful sunny day",        # 1 - similar to 0
-            "Quantum entanglement in photons",   # 2 - dissimilar to 0
+            "The weather is sunny today",  # 0
+            "It's a beautiful sunny day",  # 1 - similar to 0
+            "Quantum entanglement in photons",  # 2 - dissimilar to 0
         ]
         r = fetch(f"{base}/v1/embeddings", {"input": all_texts})
         vecs = [d["embedding"] for d in sorted(r["data"], key=lambda x: x["index"])]
@@ -140,7 +141,7 @@ def main():
 
     # Summary
     total = passed + failed
-    print(f"\n{'='*40}")
+    print(f"\n{'=' * 40}")
     print(f"Results: {passed}/{total} passed, {failed} failed")
     if failed:
         print("SOME TESTS FAILED")

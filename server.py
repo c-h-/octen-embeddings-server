@@ -13,27 +13,27 @@ Key differences from base Qwen3:
   - OpenAI-compatible /v1/embeddings response format
 """
 
+import asyncio
+import logging
 import os
 import sys
 import time
-import asyncio
-import logging
-from typing import List, Optional, Dict, Any, Tuple, Union
 from contextlib import asynccontextmanager
-from dataclasses import dataclass
 
-import numpy as np
 import mlx.core as mx
-from mlx_lm import load
-from fastapi import FastAPI, HTTPException, Request, status
-from fastapi.responses import JSONResponse
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field
+import numpy as np
 import uvicorn
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from mlx_lm import load
 from prometheus_client import (
-    Counter, Histogram, Gauge,
-    generate_latest, CONTENT_TYPE_LATEST,
+    CONTENT_TYPE_LATEST,
+    Counter,
+    Gauge,
+    Histogram,
+    generate_latest,
 )
+from pydantic import BaseModel, Field
 from starlette.responses import Response
 
 # ---------------------------------------------------------------------------
@@ -43,7 +43,7 @@ from starlette.responses import Response
 MODEL_ID = os.getenv("MODEL_ID", "Octen/Octen-Embedding-8B")
 MLX_MODEL_PATH = os.getenv(
     "MLX_MODEL_PATH",
-    os.path.expanduser("~/personal/octen-embeddings-server/models/Octen-Embedding-8B-mlx"),
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "models", "Octen-Embedding-8B-mlx"),
 )
 EMBEDDING_DIM = 4096
 MAX_TEXT_LENGTH = int(os.getenv("MAX_TEXT_LENGTH", "8192"))
@@ -98,6 +98,7 @@ MODEL_LOADED = Gauge(
 # Model manager
 # ---------------------------------------------------------------------------
 
+
 class ModelManager:
     """Loads and manages the MLX model for embedding generation."""
 
@@ -105,7 +106,7 @@ class ModelManager:
         self.model = None
         self.tokenizer = None
         self.ready = False
-        self.load_time: Optional[float] = None
+        self.load_time: float | None = None
         self._lock = asyncio.Lock()
 
     async def load(self) -> None:
@@ -138,9 +139,7 @@ class ModelManager:
         # Causal mask is required — Octen is a Qwen3 fine-tune (decoder-only)
         # trained with causal attention. Without it, embeddings degrade severely.
         seq_len = input_ids.shape[1]
-        mask = mx.triu(
-            mx.full((seq_len, seq_len), float("-inf"), dtype=h.dtype), k=1
-        )
+        mask = mx.triu(mx.full((seq_len, seq_len), float("-inf"), dtype=h.dtype), k=1)
         for layer in self.model.model.layers:
             h = layer(h, mask=mask, cache=None)
         h = self.model.model.norm(h)
@@ -151,7 +150,7 @@ class ModelManager:
         last = last / mx.maximum(norm, mx.array(1e-9))
         return last
 
-    def embed(self, texts: List[str]) -> np.ndarray:
+    def embed(self, texts: list[str]) -> np.ndarray:
         """Embed a list of texts. Returns (N, 4096) float32 numpy array."""
         results = []
         for text in texts:
@@ -173,50 +172,60 @@ manager = ModelManager()
 # Pydantic request / response models  (OpenAI-compatible)
 # ---------------------------------------------------------------------------
 
+
 class EmbeddingRequest(BaseModel):
     """OpenAI-compatible /v1/embeddings request."""
-    input: Union[str, List[str]] = Field(..., description="Text(s) to embed")
+
+    input: str | list[str] = Field(..., description="Text(s) to embed")
     model: str = Field(default=MODEL_ID, description="Model identifier (ignored, single-model server)")
-    encoding_format: Optional[str] = Field(default="float", description="Encoding format")
+    encoding_format: str | None = Field(default="float", description="Encoding format")
+
 
 class EmbeddingObject(BaseModel):
     object: str = "embedding"
-    embedding: List[float]
+    embedding: list[float]
     index: int
+
 
 class UsageInfo(BaseModel):
     prompt_tokens: int
     total_tokens: int
 
+
 class EmbeddingResponse(BaseModel):
     """OpenAI-compatible /v1/embeddings response."""
+
     object: str = "list"
-    data: List[EmbeddingObject]
+    data: list[EmbeddingObject]
     model: str
     usage: UsageInfo
 
 
 # Also support the legacy /embed and /embed_batch endpoints from qwen3 server
 
+
 class LegacyEmbedRequest(BaseModel):
     text: str = Field(..., min_length=1)
-    model: Optional[str] = None
+    model: str | None = None
     normalize: bool = True
 
+
 class LegacyEmbedResponse(BaseModel):
-    embedding: List[float]
+    embedding: list[float]
     model: str
     dim: int
     normalized: bool
     processing_time_ms: float
 
+
 class LegacyBatchRequest(BaseModel):
-    texts: List[str] = Field(..., min_length=1)
-    model: Optional[str] = None
+    texts: list[str] = Field(..., min_length=1)
+    model: str | None = None
     normalize: bool = True
 
+
 class LegacyBatchResponse(BaseModel):
-    embeddings: List[List[float]]
+    embeddings: list[list[float]]
     model: str
     dim: int
     count: int
@@ -227,6 +236,7 @@ class LegacyBatchResponse(BaseModel):
 # ---------------------------------------------------------------------------
 # Application
 # ---------------------------------------------------------------------------
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -259,6 +269,7 @@ app.add_middleware(
 # OpenAI-compatible endpoint
 # ---------------------------------------------------------------------------
 
+
 @app.post("/v1/embeddings", response_model=EmbeddingResponse)
 async def openai_embeddings(request: EmbeddingRequest):
     """OpenAI-compatible embeddings endpoint."""
@@ -287,14 +298,13 @@ async def openai_embeddings(request: EmbeddingRequest):
     total_tokens = sum(len(t) for t in texts) // 4 or 1
     TOKENS_TOTAL.inc(total_tokens)
 
-    data = [
-        EmbeddingObject(embedding=emb.tolist(), index=i)
-        for i, emb in enumerate(embeddings)
-    ]
+    data = [EmbeddingObject(embedding=emb.tolist(), index=i) for i, emb in enumerate(embeddings)]
 
     logger.info(
         "Embedded %d text(s) in %.1fms (%.0f tok/s est.)",
-        len(texts), elapsed_ms, total_tokens / (elapsed_ms / 1000) if elapsed_ms > 0 else 0,
+        len(texts),
+        elapsed_ms,
+        total_tokens / (elapsed_ms / 1000) if elapsed_ms > 0 else 0,
     )
 
     return EmbeddingResponse(
@@ -307,6 +317,7 @@ async def openai_embeddings(request: EmbeddingRequest):
 # ---------------------------------------------------------------------------
 # Legacy endpoints (compatible with qwen3-embeddings-mlx consumers)
 # ---------------------------------------------------------------------------
+
 
 @app.post("/embed", response_model=LegacyEmbedResponse)
 async def embed_single(request: LegacyEmbedRequest):
@@ -326,6 +337,7 @@ async def embed_single(request: LegacyEmbedRequest):
         normalized=request.normalize,
         processing_time_ms=elapsed,
     )
+
 
 @app.post("/embed_batch", response_model=LegacyBatchResponse)
 async def embed_batch(request: LegacyBatchRequest):
@@ -354,16 +366,19 @@ async def embed_batch(request: LegacyBatchRequest):
 # Monitoring
 # ---------------------------------------------------------------------------
 
+
 @app.get("/metrics")
 async def metrics():
     """Prometheus metrics endpoint."""
     return Response(content=generate_latest(), media_type=CONTENT_TYPE_LATEST)
+
 
 @app.get("/health")
 async def health():
     memory_mb = None
     try:
         import psutil
+
         memory_mb = psutil.Process().memory_info().rss / 1024 / 1024
     except ImportError:
         pass
@@ -375,6 +390,7 @@ async def health():
         "memory_usage_mb": round(memory_mb, 1) if memory_mb else None,
         "uptime_seconds": round(uptime, 1),
     }
+
 
 @app.get("/v1/models")
 async def list_models():
@@ -391,6 +407,7 @@ async def list_models():
         ],
     }
 
+
 @app.get("/models")
 async def list_models_legacy():
     return {
@@ -405,6 +422,7 @@ async def list_models_legacy():
 # Main
 # ---------------------------------------------------------------------------
 
+
 def main():
     uvicorn.run(
         "server:app",
@@ -413,6 +431,7 @@ def main():
         log_level=os.getenv("LOG_LEVEL", "info").lower(),
         reload=os.getenv("DEV_MODE", "false").lower() == "true",
     )
+
 
 if __name__ == "__main__":
     main()
