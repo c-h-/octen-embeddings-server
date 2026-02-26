@@ -184,7 +184,10 @@ class ModelManager:
             tokens = self.tokenizer.encode(text)
             if len(tokens) > limit:
                 logger.warning(
-                    "Text %d truncated from %d to %d tokens", i, len(tokens), limit,
+                    "Text %d truncated from %d to %d tokens",
+                    i,
+                    len(tokens),
+                    limit,
                 )
                 tokens = tokens[:limit]
             all_tokens.append(tokens)
@@ -207,7 +210,8 @@ class ModelManager:
             except Exception:
                 logger.error(
                     "Failed to embed text %d (len=%d tokens), returning zero vector",
-                    i, len(tokens),
+                    i,
+                    len(tokens),
                 )
                 results.append(np.zeros(EMBEDDING_DIM, dtype=np.float32))
 
@@ -241,8 +245,7 @@ class EmbeddingRequest(BaseModel):
     encoding_format: str | None = Field(default="float", description="Encoding format")
     max_tokens: int | None = Field(
         default=None,
-        description="Max tokens per text — inputs longer than this are truncated. "
-        "Defaults to server-wide MAX_TOKENS.",
+        description="Max tokens per text — inputs longer than this are truncated. Defaults to server-wide MAX_TOKENS.",
     )
 
 
