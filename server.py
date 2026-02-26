@@ -47,7 +47,7 @@ MLX_MODEL_PATH = os.getenv(
     os.path.join(os.path.dirname(os.path.abspath(__file__)), "models", "Octen-Embedding-8B-mlx"),
 )
 EMBEDDING_DIM = 4096
-MAX_TEXT_LENGTH = int(os.getenv("MAX_TEXT_LENGTH", "8192"))
+MAX_TOKENS = int(os.getenv("MAX_TOKENS", os.getenv("MAX_TEXT_LENGTH", "8192")))
 MAX_BATCH_SIZE = int(os.getenv("MAX_BATCH_SIZE", "256"))
 PORT = int(os.getenv("PORT", "8100"))
 HOST = os.getenv("HOST", "127.0.0.1")
@@ -167,22 +167,54 @@ class ModelManager:
         last = last / mx.maximum(norm, mx.array(1e-9))
         return last
 
-    def embed(self, texts: list[str]) -> np.ndarray:
+    def embed(self, texts: list[str], max_tokens: int | None = None) -> np.ndarray:
         """Embed a list of texts. Returns (N, 4096) float32 numpy array.
 
-        Texts are tokenized, padded to equal length, and processed as a
-        single batched forward pass for significantly higher throughput on
-        Apple Silicon compared to sequential processing.
+        Texts are tokenized, truncated to *max_tokens* (falls back to the
+        server-wide ``MAX_TOKENS``), padded, and processed as a batched
+        forward pass.  If the batch forward fails (e.g. OOM), individual
+        texts are retried one-by-one so that a single bad item does not
+        take down the whole request.
         """
-        # Tokenize all texts and truncate to MAX_TEXT_LENGTH
-        all_tokens = []
-        for text in texts:
+        limit = max_tokens or MAX_TOKENS
+
+        # Tokenize all texts and truncate
+        all_tokens: list[list[int]] = []
+        for i, text in enumerate(texts):
             tokens = self.tokenizer.encode(text)
-            if len(tokens) > MAX_TEXT_LENGTH:
-                tokens = tokens[:MAX_TEXT_LENGTH]
+            if len(tokens) > limit:
+                logger.warning(
+                    "Text %d truncated from %d to %d tokens", i, len(tokens), limit,
+                )
+                tokens = tokens[:limit]
             all_tokens.append(tokens)
 
-        # Pad to the longest sequence in this batch
+        # Try batch forward first
+        try:
+            return self._embed_batch(all_tokens)
+        except Exception:
+            logger.warning(
+                "Batch forward failed for %d texts, falling back to individual processing",
+                len(all_tokens),
+            )
+
+        # Fallback: process one-by-one
+        results: list[np.ndarray] = []
+        for i, tokens in enumerate(all_tokens):
+            try:
+                result = self._embed_batch([tokens])
+                results.append(result[0])
+            except Exception:
+                logger.error(
+                    "Failed to embed text %d (len=%d tokens), returning zero vector",
+                    i, len(tokens),
+                )
+                results.append(np.zeros(EMBEDDING_DIM, dtype=np.float32))
+
+        return np.array(results, dtype=np.float32)
+
+    def _embed_batch(self, all_tokens: list[list[int]]) -> np.ndarray:
+        """Embed pre-tokenized texts as a single padded batch."""
         max_len = max(len(t) for t in all_tokens)
         pad_id = self.tokenizer.pad_token_id if self.tokenizer.pad_token_id is not None else 0
         padded = [t + [pad_id] * (max_len - len(t)) for t in all_tokens]
@@ -207,6 +239,11 @@ class EmbeddingRequest(BaseModel):
     input: str | list[str] = Field(..., description="Text(s) to embed")
     model: str = Field(default=MODEL_ID, description="Model identifier (ignored, single-model server)")
     encoding_format: str | None = Field(default="float", description="Encoding format")
+    max_tokens: int | None = Field(
+        default=None,
+        description="Max tokens per text — inputs longer than this are truncated. "
+        "Defaults to server-wide MAX_TOKENS.",
+    )
 
 
 class EmbeddingObject(BaseModel):
@@ -339,7 +376,7 @@ async def openai_embeddings(request: EmbeddingRequest):
     BATCH_SIZE.observe(len(texts))
 
     t0 = time.time()
-    embeddings = manager.embed(texts)
+    embeddings = manager.embed(texts, max_tokens=request.max_tokens)
     elapsed = time.time() - t0
     elapsed_ms = elapsed * 1000
 

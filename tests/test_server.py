@@ -4,7 +4,7 @@ These tests mock the model manager so they run without MLX model weights.
 They verify API contracts, request validation, and response formats.
 """
 
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import numpy as np
 import pytest
@@ -19,7 +19,7 @@ def mock_model_manager():
     fake_embedding = np.random.randn(4096).astype(np.float32)
     fake_embedding /= np.linalg.norm(fake_embedding)
 
-    def fake_embed(texts):
+    def fake_embed(texts, **kwargs):
         return np.array([fake_embedding] * len(texts), dtype=np.float32)
 
     with (
@@ -199,3 +199,184 @@ class TestGracefulShutdown:
         resp = client.get("/metrics")
         assert resp.status_code == 200
         client.app.state.shutting_down = False
+
+
+class TestLongTextTruncation:
+    """Test that long texts are truncated to max token limit."""
+
+    def _make_manager(self):
+        """Create a ModelManager with a mock tokenizer and forward pass."""
+        mgr = server.ModelManager()
+        mgr.tokenizer = MagicMock()
+        mgr.tokenizer.pad_token_id = 0
+        mgr.ready = True
+        return mgr
+
+    def test_truncation_to_max_tokens(self):
+        mgr = self._make_manager()
+        # Simulate tokenizer returning 10000 tokens
+        mgr.tokenizer.encode.return_value = list(range(10000))
+
+        fake_emb = np.random.randn(1, 4096).astype(np.float32)
+        with patch.object(mgr, "_embed_batch", return_value=fake_emb) as mock_batch:
+            mgr.embed(["very long text"])
+            # _embed_batch should receive tokens truncated to MAX_TOKENS (8192)
+            called_tokens = mock_batch.call_args[0][0]
+            assert len(called_tokens[0]) == server.MAX_TOKENS
+
+    def test_truncation_to_custom_max_tokens(self):
+        mgr = self._make_manager()
+        mgr.tokenizer.encode.return_value = list(range(500))
+
+        fake_emb = np.random.randn(1, 4096).astype(np.float32)
+        with patch.object(mgr, "_embed_batch", return_value=fake_emb) as mock_batch:
+            mgr.embed(["medium text"], max_tokens=100)
+            called_tokens = mock_batch.call_args[0][0]
+            assert len(called_tokens[0]) == 100
+
+    def test_short_text_not_truncated(self):
+        mgr = self._make_manager()
+        mgr.tokenizer.encode.return_value = list(range(50))
+
+        fake_emb = np.random.randn(1, 4096).astype(np.float32)
+        with patch.object(mgr, "_embed_batch", return_value=fake_emb) as mock_batch:
+            mgr.embed(["short"])
+            called_tokens = mock_batch.call_args[0][0]
+            assert len(called_tokens[0]) == 50
+
+    def test_request_level_max_tokens(self, client):
+        """The /v1/embeddings endpoint accepts max_tokens in the request body."""
+        resp = client.post(
+            "/v1/embeddings",
+            json={"input": "test", "max_tokens": 512},
+        )
+        assert resp.status_code == 200
+        # Verify embed was called with max_tokens kwarg
+        server.manager.embed.assert_called_once()
+        _, kwargs = server.manager.embed.call_args
+        assert kwargs["max_tokens"] == 512
+
+
+class TestBatchErrorResilience:
+    """Test that a single failing item does not break the whole batch."""
+
+    def _make_manager(self):
+        mgr = server.ModelManager()
+        mgr.tokenizer = MagicMock()
+        mgr.tokenizer.pad_token_id = 0
+        mgr.ready = True
+        return mgr
+
+    def test_batch_failure_falls_back_to_individual(self):
+        mgr = self._make_manager()
+        mgr.tokenizer.encode.side_effect = [
+            list(range(10)),
+            list(range(20)),
+            list(range(15)),
+        ]
+
+        good_emb = np.random.randn(1, 4096).astype(np.float32)
+        call_count = 0
+
+        def selective_embed(tokens):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                # First call is the batch — make it fail
+                raise RuntimeError("OOM")
+            return good_emb
+
+        with patch.object(mgr, "_embed_batch", side_effect=selective_embed):
+            result = mgr.embed(["a", "b", "c"])
+            assert result.shape == (3, 4096)
+            # 1 batch attempt + 3 individual attempts = 4 calls
+            assert call_count == 4
+
+    def test_individual_item_failure_returns_zero_vector(self):
+        mgr = self._make_manager()
+        mgr.tokenizer.encode.side_effect = [
+            list(range(10)),
+            list(range(20)),
+        ]
+
+        good_emb = np.ones((1, 4096), dtype=np.float32)
+        call_count = 0
+
+        def selective_embed(tokens):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                # Batch fails
+                raise RuntimeError("OOM")
+            if call_count == 3:
+                # Second individual item fails
+                raise RuntimeError("bad text")
+            return good_emb
+
+        with patch.object(mgr, "_embed_batch", side_effect=selective_embed):
+            result = mgr.embed(["ok text", "bad text"])
+
+        assert result.shape == (2, 4096)
+        # First item should have real embedding
+        assert np.all(result[0] == 1.0)
+        # Second item should be zero vector
+        assert np.all(result[1] == 0.0)
+
+    def test_batch_success_no_fallback(self):
+        mgr = self._make_manager()
+        mgr.tokenizer.encode.side_effect = [list(range(10)), list(range(20))]
+
+        batch_emb = np.ones((2, 4096), dtype=np.float32)
+        with patch.object(mgr, "_embed_batch", return_value=batch_emb) as mock_batch:
+            result = mgr.embed(["a", "b"])
+            assert result.shape == (2, 4096)
+            # Only one call — the batch succeeded
+            assert mock_batch.call_count == 1
+
+    def test_batch_error_via_endpoint(self, client):
+        """Batch request with mixed results still returns 200."""
+        resp = client.post(
+            "/v1/embeddings",
+            json={"input": ["good text", "another good text"]},
+        )
+        assert resp.status_code == 200
+        body = resp.json()
+        assert len(body["data"]) == 2
+
+
+class TestMaxTokensConfig:
+    """Test MAX_TOKENS configuration controls truncation."""
+
+    def test_server_max_tokens_controls_truncation(self):
+        """Patching server.MAX_TOKENS limits token length in embed()."""
+        mgr = server.ModelManager()
+        mgr.tokenizer = MagicMock()
+        mgr.tokenizer.pad_token_id = 0
+        mgr.tokenizer.encode.return_value = list(range(200))
+        mgr.ready = True
+
+        fake_emb = np.random.randn(1, 4096).astype(np.float32)
+        with (
+            patch.object(server, "MAX_TOKENS", 50),
+            patch.object(mgr, "_embed_batch", return_value=fake_emb) as mock_batch,
+        ):
+            mgr.embed(["long text"])
+            called_tokens = mock_batch.call_args[0][0]
+            assert len(called_tokens[0]) == 50
+
+    def test_request_max_tokens_overrides_server_default(self):
+        """Per-request max_tokens overrides the server-wide MAX_TOKENS."""
+        mgr = server.ModelManager()
+        mgr.tokenizer = MagicMock()
+        mgr.tokenizer.pad_token_id = 0
+        mgr.tokenizer.encode.return_value = list(range(200))
+        mgr.ready = True
+
+        fake_emb = np.random.randn(1, 4096).astype(np.float32)
+        with (
+            patch.object(server, "MAX_TOKENS", 8192),
+            patch.object(mgr, "_embed_batch", return_value=fake_emb) as mock_batch,
+        ):
+            mgr.embed(["long text"], max_tokens=30)
+            called_tokens = mock_batch.call_args[0][0]
+            assert len(called_tokens[0]) == 30
