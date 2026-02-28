@@ -47,7 +47,7 @@ MLX_MODEL_PATH = os.getenv(
     os.path.join(os.path.dirname(os.path.abspath(__file__)), "models", "Octen-Embedding-8B-mlx"),
 )
 EMBEDDING_DIM = 4096
-MAX_TOKENS = int(os.getenv("MAX_TOKENS", os.getenv("MAX_TEXT_LENGTH", "8192")))
+MAX_TEXT_LENGTH = int(os.getenv("MAX_TEXT_LENGTH", "8192"))
 MAX_BATCH_SIZE = int(os.getenv("MAX_BATCH_SIZE", "256"))
 PORT = int(os.getenv("PORT", "8100"))
 HOST = os.getenv("HOST", "127.0.0.1")
@@ -87,27 +87,35 @@ async def verify_api_key(request: Request):
 # ---------------------------------------------------------------------------
 
 REQUESTS_TOTAL = Counter(
-    "embeddings_requests_total",
+    "octen_requests_total",
     "Total embedding requests",
-    ["endpoint"],
+    ["status"],
 )
 DURATION_SECONDS = Histogram(
-    "embeddings_duration_seconds",
+    "octen_request_duration_seconds",
     "Embedding request duration in seconds",
-    ["endpoint"],
+    buckets=[0.1, 0.5, 1.0, 2.5, 5.0, 10.0],
 )
 BATCH_SIZE = Histogram(
-    "embeddings_batch_size",
+    "octen_batch_size",
     "Number of texts per embedding request",
     buckets=[1, 2, 4, 8, 16, 32, 64, 128, 256],
 )
 TOKENS_TOTAL = Counter(
-    "embeddings_tokens_total",
+    "octen_tokens_total",
     "Total tokens processed (estimated)",
 )
 MODEL_LOADED = Gauge(
-    "embeddings_model_loaded",
+    "octen_model_loaded",
     "Whether the embedding model is loaded (1) or not (0)",
+)
+MEMORY_BYTES = Gauge(
+    "octen_memory_bytes",
+    "Process RSS memory in bytes",
+)
+UPTIME_SECONDS = Gauge(
+    "octen_uptime_seconds",
+    "Server uptime in seconds",
 )
 
 
@@ -167,58 +175,22 @@ class ModelManager:
         last = last / mx.maximum(norm, mx.array(1e-9))
         return last
 
-    def embed(self, texts: list[str], max_tokens: int | None = None) -> np.ndarray:
+    def embed(self, texts: list[str]) -> np.ndarray:
         """Embed a list of texts. Returns (N, 4096) float32 numpy array.
 
-        Texts are tokenized, truncated to *max_tokens* (falls back to the
-        server-wide ``MAX_TOKENS``), padded, and processed as a batched
-        forward pass.  If the batch forward fails (e.g. OOM), individual
-        texts are retried one-by-one so that a single bad item does not
-        take down the whole request.
+        Texts are tokenized, padded to equal length, and processed as a
+        single batched forward pass for significantly higher throughput on
+        Apple Silicon compared to sequential processing.
         """
-        limit = max_tokens or MAX_TOKENS
-
-        # Tokenize all texts and truncate
-        all_tokens: list[list[int]] = []
-        for i, text in enumerate(texts):
+        # Tokenize all texts and truncate to MAX_TEXT_LENGTH
+        all_tokens = []
+        for text in texts:
             tokens = self.tokenizer.encode(text)
-            if len(tokens) > limit:
-                logger.warning(
-                    "Text %d truncated from %d to %d tokens",
-                    i,
-                    len(tokens),
-                    limit,
-                )
-                tokens = tokens[:limit]
+            if len(tokens) > MAX_TEXT_LENGTH:
+                tokens = tokens[:MAX_TEXT_LENGTH]
             all_tokens.append(tokens)
 
-        # Try batch forward first
-        try:
-            return self._embed_batch(all_tokens)
-        except Exception:
-            logger.warning(
-                "Batch forward failed for %d texts, falling back to individual processing",
-                len(all_tokens),
-            )
-
-        # Fallback: process one-by-one
-        results: list[np.ndarray] = []
-        for i, tokens in enumerate(all_tokens):
-            try:
-                result = self._embed_batch([tokens])
-                results.append(result[0])
-            except Exception:
-                logger.error(
-                    "Failed to embed text %d (len=%d tokens), returning zero vector",
-                    i,
-                    len(tokens),
-                )
-                results.append(np.zeros(EMBEDDING_DIM, dtype=np.float32))
-
-        return np.array(results, dtype=np.float32)
-
-    def _embed_batch(self, all_tokens: list[list[int]]) -> np.ndarray:
-        """Embed pre-tokenized texts as a single padded batch."""
+        # Pad to the longest sequence in this batch
         max_len = max(len(t) for t in all_tokens)
         pad_id = self.tokenizer.pad_token_id if self.tokenizer.pad_token_id is not None else 0
         padded = [t + [pad_id] * (max_len - len(t)) for t in all_tokens]
@@ -243,10 +215,6 @@ class EmbeddingRequest(BaseModel):
     input: str | list[str] = Field(..., description="Text(s) to embed")
     model: str = Field(default=MODEL_ID, description="Model identifier (ignored, single-model server)")
     encoding_format: str | None = Field(default="float", description="Encoding format")
-    max_tokens: int | None = Field(
-        default=None,
-        description="Max tokens per text — inputs longer than this are truncated. Defaults to server-wide MAX_TOKENS.",
-    )
 
 
 class EmbeddingObject(BaseModel):
@@ -375,15 +343,19 @@ async def openai_embeddings(request: EmbeddingRequest):
     if not texts:
         raise HTTPException(400, "Input must not be empty")
 
-    REQUESTS_TOTAL.labels(endpoint="/v1/embeddings").inc()
     BATCH_SIZE.observe(len(texts))
 
     t0 = time.time()
-    embeddings = manager.embed(texts, max_tokens=request.max_tokens)
+    try:
+        embeddings = manager.embed(texts, max_tokens=request.max_tokens)
+    except Exception:
+        REQUESTS_TOTAL.labels(status="error").inc()
+        raise
     elapsed = time.time() - t0
     elapsed_ms = elapsed * 1000
 
-    DURATION_SECONDS.labels(endpoint="/v1/embeddings").observe(elapsed)
+    REQUESTS_TOTAL.labels(status="success").inc()
+    DURATION_SECONDS.observe(elapsed)
 
     # Estimate token count (rough: chars / 4)
     total_tokens = sum(len(t) for t in texts) // 4 or 1
@@ -414,12 +386,16 @@ async def openai_embeddings(request: EmbeddingRequest):
 async def embed_single(request: LegacyEmbedRequest):
     if not manager.ready:
         raise HTTPException(503, "Model not loaded yet")
-    REQUESTS_TOTAL.labels(endpoint="/embed").inc()
     BATCH_SIZE.observe(1)
     t0 = time.time()
-    embeddings = manager.embed([request.text])
+    try:
+        embeddings = manager.embed([request.text])
+    except Exception:
+        REQUESTS_TOTAL.labels(status="error").inc()
+        raise
     elapsed = (time.time() - t0) * 1000
-    DURATION_SECONDS.labels(endpoint="/embed").observe(elapsed / 1000)
+    REQUESTS_TOTAL.labels(status="success").inc()
+    DURATION_SECONDS.observe(elapsed / 1000)
     TOKENS_TOTAL.inc(len(request.text) // 4 or 1)
     return LegacyEmbedResponse(
         embedding=embeddings[0].tolist(),
@@ -436,12 +412,16 @@ async def embed_batch(request: LegacyBatchRequest):
         raise HTTPException(503, "Model not loaded yet")
     if len(request.texts) > MAX_BATCH_SIZE:
         raise HTTPException(400, f"Batch too large: {len(request.texts)} > {MAX_BATCH_SIZE}")
-    REQUESTS_TOTAL.labels(endpoint="/embed_batch").inc()
     BATCH_SIZE.observe(len(request.texts))
     t0 = time.time()
-    embeddings = manager.embed(request.texts)
+    try:
+        embeddings = manager.embed(request.texts)
+    except Exception:
+        REQUESTS_TOTAL.labels(status="error").inc()
+        raise
     elapsed = (time.time() - t0) * 1000
-    DURATION_SECONDS.labels(endpoint="/embed_batch").observe(elapsed / 1000)
+    REQUESTS_TOTAL.labels(status="success").inc()
+    DURATION_SECONDS.observe(elapsed / 1000)
     TOKENS_TOTAL.inc(sum(len(t) for t in request.texts) // 4 or 1)
     return LegacyBatchResponse(
         embeddings=embeddings.tolist(),
@@ -458,28 +438,53 @@ async def embed_batch(request: LegacyBatchRequest):
 # ---------------------------------------------------------------------------
 
 
+def _update_dynamic_gauges():
+    """Refresh memory and uptime gauges before scraping."""
+    uptime = time.time() - app.state.start_time if hasattr(app.state, "start_time") else 0
+    UPTIME_SECONDS.set(round(uptime, 1))
+    try:
+        import psutil
+
+        MEMORY_BYTES.set(psutil.Process().memory_info().rss)
+    except ImportError:
+        pass
+
+
+def _get_counter_value(counter, label_dict):
+    """Read the current value of a labelled Prometheus counter."""
+    try:
+        return counter.labels(**label_dict)._value.get()
+    except Exception:
+        return 0
+
+
 @app.get("/metrics")
 async def metrics():
     """Prometheus metrics endpoint."""
+    _update_dynamic_gauges()
     return Response(content=generate_latest(), media_type=CONTENT_TYPE_LATEST)
 
 
 @app.get("/health")
 async def health():
-    memory_mb = None
+    rss_bytes = None
     try:
         import psutil
 
-        memory_mb = psutil.Process().memory_info().rss / 1024 / 1024
+        rss_bytes = psutil.Process().memory_info().rss
     except ImportError:
         pass
     uptime = time.time() - app.state.start_time if hasattr(app.state, "start_time") else 0
+    requests_served = _get_counter_value(REQUESTS_TOTAL, {"status": "success"})
+    errors = _get_counter_value(REQUESTS_TOTAL, {"status": "error"})
     return {
-        "status": "healthy" if manager.ready else "loading",
-        "model": MODEL_ID,
-        "embedding_dim": EMBEDDING_DIM,
-        "memory_usage_mb": round(memory_mb, 1) if memory_mb else None,
+        "status": "ok" if manager.ready else "loading",
         "uptime_seconds": round(uptime, 1),
+        "model": MODEL_ID,
+        "requests_served": int(requests_served),
+        "errors": int(errors),
+        "embedding_dim": EMBEDDING_DIM,
+        "memory_usage_mb": round(rss_bytes / 1024 / 1024, 1) if rss_bytes else None,
     }
 
 
