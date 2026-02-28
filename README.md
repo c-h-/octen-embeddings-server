@@ -37,16 +37,27 @@ Or install as a package:
 pip install -e .
 ```
 
-### 2. Download and convert the model
+### 2. Download the model
 
-The model must be converted from HuggingFace format to MLX format. This downloads ~16 GB and requires ~32 GB free disk temporarily.
+**Option A: Pre-converted weights (recommended)**
+
+Download the ready-to-use MLX weights from HuggingFace (~16 GB):
+
+```bash
+pip install huggingface-hub
+huggingface-cli download chulcher/Octen-Embedding-8B-mlx --local-dir models/Octen-Embedding-8B-mlx
+```
+
+**Option B: Convert from scratch**
+
+If you prefer to convert the original model yourself (~32 GB temp disk required):
 
 ```bash
 pip install huggingface-hub  # or: pip install -e ".[convert]"
 python3 convert_model.py
 ```
 
-This creates `models/Octen-Embedding-8B-mlx/` with the converted weights.
+Both options create `models/Octen-Embedding-8B-mlx/` with the MLX weights.
 
 ### 3. Start the server
 
