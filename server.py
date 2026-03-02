@@ -347,7 +347,7 @@ async def openai_embeddings(request: EmbeddingRequest):
 
     t0 = time.time()
     try:
-        embeddings = manager.embed(texts, max_tokens=request.max_tokens)
+        embeddings = manager.embed(texts)
     except Exception:
         REQUESTS_TOTAL.labels(status="error").inc()
         raise
@@ -466,7 +466,8 @@ async def metrics():
 
 
 @app.get("/health")
-async def health():
+async def health(deep: bool = False):
+    """Health check. Use ?deep=true to exercise the embedding path."""
     rss_bytes = None
     try:
         import psutil
@@ -477,8 +478,24 @@ async def health():
     uptime = time.time() - app.state.start_time if hasattr(app.state, "start_time") else 0
     requests_served = _get_counter_value(REQUESTS_TOTAL, {"status": "success"})
     errors = _get_counter_value(REQUESTS_TOTAL, {"status": "error"})
-    return {
-        "status": "ok" if manager.ready else "loading",
+
+    status = "ok" if manager.ready else "loading"
+    embed_check = None
+
+    if deep and manager.ready:
+        try:
+            result = manager.embed(["health check probe"])
+            if result is not None and len(result) == 1 and len(result[0]) == EMBEDDING_DIM:
+                embed_check = "ok"
+            else:
+                embed_check = "fail: unexpected shape"
+                status = "degraded"
+        except Exception as e:
+            embed_check = f"fail: {e}"
+            status = "degraded"
+
+    resp = {
+        "status": status,
         "uptime_seconds": round(uptime, 1),
         "model": MODEL_ID,
         "requests_served": int(requests_served),
@@ -486,6 +503,9 @@ async def health():
         "embedding_dim": EMBEDDING_DIM,
         "memory_usage_mb": round(rss_bytes / 1024 / 1024, 1) if rss_bytes else None,
     }
+    if embed_check is not None:
+        resp["embed_check"] = embed_check
+    return resp
 
 
 @app.get("/v1/models")
